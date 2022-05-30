@@ -24,8 +24,8 @@
 
 #include <visualization_msgs/Marker.h>
 
-#include "rvio/Updater.h"
-#include "numerics.h"
+#include "Updater.h"
+#include "../util/Numerics.h"
 
 
 namespace RVIO
@@ -35,15 +35,13 @@ static int cloud_id = 0;
 std_msgs::ColorRGBA colorLandmark;
 geometry_msgs::Vector3 scaleLandmark;
 
-Updater::Updater(const std::string& strSettingsFile)
+Updater::Updater(const cv::FileStorage& fsSettings)
 {
-    // Read settings file
-    cv::FileStorage fsSettings(strSettingsFile, cv::FileStorage::READ);
-
     mnCamRate = fsSettings["Camera.fps"];
 
-    msigmaImageNoiseX = fsSettings["Camera.sigma_px"];
-    msigmaImageNoiseY = fsSettings["Camera.sigma_py"];
+    const float nImageNoiseSigmaX = fsSettings["Camera.sigma_px"];
+    const float nImageNoiseSigmaY = fsSettings["Camera.sigma_py"];
+    mnImageNoiseSigma = std::max(nImageNoiseSigmaX, nImageNoiseSigmaY);
 
     cv::Mat T(4,4,CV_32F);
     fsSettings["Camera.T_BC0"] >> T;
@@ -73,8 +71,8 @@ Updater::Updater(const std::string& strSettingsFile)
 
 void Updater::update(Eigen::VectorXd& xk1k,
                      Eigen::MatrixXd& Pk1k,
-                     std::vector<char>& pvFeatTypesForUpdate,
-                     std::vector<std::list<cv::Point2f> >& pvlFeatMeasForUpdate)
+                     std::vector<unsigned char>& vFeatTypesForUpdate,
+                     std::vector<std::list<cv::Point2f> >& vlFeatMeasForUpdate)
 {
     // Interact with ROS rviz
     visualization_msgs::Marker cloud;
@@ -89,16 +87,12 @@ void Updater::update(Eigen::VectorXd& xk1k,
     cloud.type = visualization_msgs::Marker::POINTS;
 
     // Number of features
-    int nFeat = (int)pvFeatTypesForUpdate.size();
+    int nFeat = (int)vFeatTypesForUpdate.size();
 
     // Number of (max) rows of matrices
     int nRows = 0;
     for (int i=0; i<nFeat; ++i)
-    {
-        // Can be used for triangulation
-        if ((int)pvlFeatMeasForUpdate.at(i).size()>2)
-            nRows += 2*(int)pvlFeatMeasForUpdate.at(i).size();
-    }
+        nRows += 2*(int)vlFeatMeasForUpdate.at(i).size();
 
     // Number of clone states
     int nCloneStates = (xk1k.rows()-26)/7;
@@ -114,8 +108,8 @@ void Updater::update(Eigen::VectorXd& xk1k,
 
     for (int featIdx=0; featIdx<nFeat; ++featIdx)
     {
-        char featType = pvFeatTypesForUpdate.at(featIdx);
-        std::list<cv::Point2f> lFeatMeas = pvlFeatMeasForUpdate.at(featIdx);
+        char featType = vFeatTypesForUpdate.at(featIdx);
+        std::list<cv::Point2f> lFeatMeas = vlFeatMeasForUpdate.at(featIdx);
 
         int nTrackLength = (int)lFeatMeas.size();
         int nTrackPhases = nTrackLength-1;
@@ -157,7 +151,7 @@ void Updater::update(Eigen::VectorXd& xk1k,
         double psi = atan2(ptFirst.x,1);
         double rho = 0.;
 
-        if (abs(phi)>.5*3.14 || abs(psi)>.5*3.14)
+        if (fabs(phi)>.5*3.14 || fabs(psi)>.5*3.14)
         {
             ROS_DEBUG("Invalid inverse-depth feature estimate (0)!");
             continue;
@@ -177,8 +171,8 @@ void Updater::update(Eigen::VectorXd& xk1k,
                 -sin(phi)*cos(psi), -cos(phi)*sin(psi);
 
         Eigen::Matrix2d Rinv;
-        Rinv << 1/pow(msigmaImageNoiseX,2), 0,
-                0, 1/pow(msigmaImageNoiseY,2);
+        Rinv << 1./pow(mnImageNoiseSigma,2), 0,
+                0, 1./pow(mnImageNoiseSigma,2);
 
         int maxIter = 10;
         double lambda = 0.01;
@@ -190,6 +184,28 @@ void Updater::update(Eigen::VectorXd& xk1k,
             Eigen::Vector3d HTRinve = Eigen::Vector3d::Zero();
             double cost = 0;
 
+            // The 1st measurement
+            Eigen::Vector3d h1 = epfinv;
+
+            Eigen::Matrix<double,2,3> Hproj1;
+            Hproj1 << 1/h1(2), 0, -h1(0)/pow(h1(2),2),
+                      0, 1/h1(2), -h1(1)/pow(h1(2),2);
+
+            Eigen::Matrix<double,2,3> H1;
+            H1 << Hproj1*Jang, Eigen::Vector2d::Zero();
+
+            cv::Point2f pt1;
+            pt1.x = h1(0)/h1(2);
+            pt1.y = h1(1)/h1(2);
+
+            Eigen::Vector2d e1;
+            e1 << (ptFirst-pt1).x, (ptFirst-pt1).y;
+
+            cost += e1.transpose()*Rinv*e1;
+            HTRinvH.noalias() += H1.transpose()*Rinv*H1;
+            HTRinve.noalias() += H1.transpose()*Rinv*e1;
+
+            // The following measurements
             std::list<cv::Point2f>::const_iterator lit = lFeatMeas.begin();
             for (int i=0; i<nTrackPhases; ++i, ++lit)
             {
@@ -212,7 +228,6 @@ void Updater::update(Eigen::VectorXd& xk1k,
                 e << ((*lit)-pt).x, ((*lit)-pt).y;
 
                 cost += e.transpose()*Rinv*e;
-
                 HTRinvH.noalias() += H.transpose()*Rinv*H;
                 HTRinve.noalias() += H.transpose()*Rinv*e;
             }
@@ -233,12 +248,12 @@ void Updater::update(Eigen::VectorXd& xk1k,
                          cos(phi), 0,
                         -sin(phi)*cos(psi), -cos(phi)*sin(psi);
 
-                if (abs(lastCost-cost)<1e-6 || dpfinv.norm()<1e-6)
+                if (fabs(lastCost-cost)<1e-6 && dpfinv(2)<1e-6)
                     break;
 
                 lambda *= .1;
                 lastCost = cost;
-            } 
+            }
             else
             {
                 // Up
@@ -247,7 +262,7 @@ void Updater::update(Eigen::VectorXd& xk1k,
             }
         }
 
-        if (std::isinf(rho) || rho<=0 || abs(phi)>.5*3.14 || abs(psi)>.5*3.14)
+        if (fabs(phi)>.5*3.14 || fabs(psi)>.5*3.14 || std::isinf(rho) || rho<0)
         {
             ROS_DEBUG("Invalid inverse-depth feature estimate (1)!");
             continue;
@@ -352,9 +367,6 @@ void Updater::update(Eigen::VectorXd& xk1k,
             nStartRow += 2;
         }
 
-        if (nStartRow<tempHf.cols())
-            continue;
-
         // ii. Feature marginalization
         int M = nStartRow;
         int N = tempHf.cols();
@@ -376,10 +388,9 @@ void Updater::update(Eigen::VectorXd& xk1k,
                 tempHf_GR.makeGivens(tempHf(m-1,n), tempHf(m,n));
 
                 // Multiply G' to the corresponding lines (m-1,m) in each matrix
-
-                // Hf
                 // Note: we only apply G' to the nonzero cols [n:N-1], which is
                 //       equivalent to applying G' to the entire row [0:N-1].
+                // G'*Hf
                 (tempHf.block(m-1,n,2,N-n)).applyOnTheLeft(0,1,tempHf_GR.adjoint());
 
                 // G'*Hx
@@ -392,14 +403,14 @@ void Updater::update(Eigen::VectorXd& xk1k,
 
         // iii. Mahalanobis distance test
         // Note: this tests the dissimilarity between the measurement and the estimate,
-        //       d=r'*Sinv*r, where Sinv*r is the solution of Sx=r, and S=H*P*H'+R.
+        //       D=r'*Sinv*r, where Sinv*r is the solution of Sx=r, and S=H*P*H'+R.
         int nDOF = M-N;
         Eigen::VectorXd tempr_ = tempr.block(N,0,nDOF,1);
         Eigen::MatrixXd tempHx_ = tempHx.block(N,0,nDOF,tempHx.cols());
 
         Eigen::VectorXd tempR;
         tempR.setOnes(nDOF,1);
-        tempR *= pow(msigmaImageNoiseX>msigmaImageNoiseY ? msigmaImageNoiseX:msigmaImageNoiseY,2);
+        tempR *= pow(mnImageNoiseSigma, 2);
 
         Eigen::MatrixXd tempS;
         tempS = tempHx_*Pk1k.block(24,24,6*nCloneStates,6*nCloneStates)*(tempHx_.transpose());
@@ -416,22 +427,25 @@ void Updater::update(Eigen::VectorXd& xk1k,
             nRowCount += nDOF;
             nGoodFeatCount++;
 
-            // Feature visualization (rviz)
-            // Note: pf is in the current reference frame {Rk}.
-            Eigen::VectorXd posek = mRelPosesToFirst.tail(7);
-            Eigen::Matrix3d Rk = QuatToRot(posek.head(4));
-            Eigen::Vector3d tk = posek.tail(3);
+            if (rho>0)
+            {
+                // Feature visualization (rviz)
+                // Note: pf is in the current reference frame {Rk}.
+                Eigen::VectorXd posek = mRelPosesToFirst.tail(7);
+                Eigen::Matrix3d Rk = QuatToRot(posek.head(4));
+                Eigen::Vector3d tk = posek.tail(3);
 
-            // pf in {C1}->{R1}->{Rk}
-            Eigen::Vector3d pfc = 1/rho*epfinv;
-            Eigen::Vector3d pf1 = mRic*pfc+mtic;
-            Eigen::Vector3d pfk = Rk*pf1+tk;
+                // pf in {C1}->{R1}->{Rk}
+                Eigen::Vector3d pfc = 1/rho*epfinv;
+                Eigen::Vector3d pf1 = mRic*pfc+mtic;
+                Eigen::Vector3d pfk = Rk*pf1+tk;
 
-            geometry_msgs::Point feat;
-            feat.x = pfk(0);
-            feat.y = pfk(1);
-            feat.z = pfk(2);
-            cloud.points.push_back(feat);
+                geometry_msgs::Point feat;
+                feat.x = pfk(0);
+                feat.y = pfk(1);
+                feat.z = pfk(2);
+                cloud.points.push_back(feat);
+            }
         }
         else
         {
@@ -450,7 +464,7 @@ void Updater::update(Eigen::VectorXd& xk1k,
 
         Eigen::VectorXd Ro;
         Ro.setOnes(nRowCount,1);
-        Ro *= pow(msigmaImageNoiseX>msigmaImageNoiseY ? msigmaImageNoiseX:msigmaImageNoiseY,2);
+        Ro *= pow(mnImageNoiseSigma, 2);
 
         // Model compression
         Eigen::VectorXd rn;
@@ -487,10 +501,9 @@ void Updater::update(Eigen::VectorXd& xk1k,
                     tempHw_GR.makeGivens(tempHw(m-1,n), tempHw(m,n));
 
                     // Multiply G' to the corresponding lines (m-1,m) in each matrix
-
-                    // Ho
                     // Note: we only apply G' to the nonzero cols [n:N-1], which is
                     //       equivalent to applying G' to the entire row [0:N-1].
+                    // G'*H
                     (tempHw.block(m-1,n,2,N-n)).applyOnTheLeft(0,1,tempHw_GR.adjoint());
 
                     // G'*r
@@ -512,7 +525,7 @@ void Updater::update(Eigen::VectorXd& xk1k,
             rn = ro.block(0,0,nRank,1);
             Hn = Ho.block(0,0,nRank,Ho.cols());
             Rn.setOnes(nRank,1);
-            Rn *= pow(msigmaImageNoiseX>msigmaImageNoiseY ? msigmaImageNoiseX:msigmaImageNoiseY,2);
+            Rn *= pow(mnImageNoiseSigma, 2);
         }
         else
         {
@@ -539,7 +552,6 @@ void Updater::update(Eigen::VectorXd& xk1k,
         dqG(2) = .5*dx(2);
 
         double dqGvn = (dqG.head(3)).norm();
-
         if (dqGvn<1)
         {
             dqG(3) = sqrt(1-pow(dqGvn,2));
@@ -564,7 +576,6 @@ void Updater::update(Eigen::VectorXd& xk1k,
         dqR(2) = .5*dx(11);
 
         double dqRvn = (dqR.head(3)).norm();
-
         if (dqRvn<1)
         {
             dqR(3) = sqrt(1-pow(dqRvn,2));
@@ -587,7 +598,6 @@ void Updater::update(Eigen::VectorXd& xk1k,
             dqc(2) = .5*dx(24+6*poseIdx+2);
 
             double dqcvn = (dqc.head(3)).norm();
-
             if (dqcvn<1)
             {
                 dqc(3) = sqrt(1-pow(dqcvn,2));

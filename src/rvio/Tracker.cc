@@ -18,20 +18,13 @@
 * along with R-VIO. If not, see <http://www.gnu.org/licenses/>.
 */
 
-#include <algorithm> // std::copy
-#include <iterator> // std::back_inserter
-
-#include <Eigen/Core>
-
-#include <opencv2/core/eigen.hpp>
 #include <opencv2/video/tracking.hpp>
 #include <opencv2/imgproc/imgproc.hpp>
 #include <opencv2/calib3d/calib3d.hpp>
 
 #include <sensor_msgs/Image.h>
 
-#include "rvio/Tracker.h"
-#include "numerics.h"
+#include "Tracker.h"
 
 
 namespace RVIO
@@ -41,14 +34,8 @@ CvScalar red = CV_RGB(255,64,64);
 CvScalar green = CV_RGB(64,255,64);
 CvScalar blue = CV_RGB(64,64,255);
 
-Tracker::Tracker(const std::string& strSettingsFile)
+Tracker::Tracker(const cv::FileStorage& fsSettings)
 {
-    // Read settings file
-    cv::FileStorage fsSettings(strSettingsFile, cv::FileStorage::READ);
-
-    mnImageWidth = fsSettings["Camera.width"];
-    mnImageHeight = fsSettings["Camera.height"];
-
     const float fx = fsSettings["Camera.fx"];
     const float fy = fsSettings["Camera.fy"];
     const float cx = fsSettings["Camera.cx"];
@@ -74,60 +61,46 @@ Tracker::Tracker(const std::string& strSettingsFile)
     }
     DistCoef.copyTo(mDistCoef);
 
-    cv::Mat T(4,4,CV_32F);
-    fsSettings["Camera.T_BC0"] >> T;
-    Eigen::Matrix4d Tic;
-    cv::cv2eigen(T,Tic);
-    mRic = Tic.block<3,3>(0,0);
-    mtic = Tic.block<3,1>(0,3);
-    mRci = mRic.transpose();
-    mtci = -mRci*mtic;
-
-    mnSmallAngle = fsSettings["IMU.nSmallAngle"];
-
-    int bIsRGB = fsSettings["Camera.RGB"];
+    const int bIsRGB = fsSettings["Camera.RGB"];
     mbIsRGB = bIsRGB;
 
-    int bIsFisheye = fsSettings["Camera.Fisheye"];
+    const int bIsFisheye = fsSettings["Camera.Fisheye"];
     mbIsFisheye = bIsFisheye;
 
-    int bEnableEqualizer = fsSettings["Tracker.EnableEqualizer"];
+    const int bEnableEqualizer = fsSettings["Tracker.EnableEqualizer"];
     mbEnableEqualizer = bEnableEqualizer;
 
     mnMaxFeatsPerImage = fsSettings["Tracker.nFeatures"];
-    mnMaxTrackingLength = fsSettings["Tracker.nTrackingLength"];
-
-    mnMaxFeatsForUpdate = std::ceil(0.5*mnMaxFeatsPerImage);
+    mnMaxFeatsForUpdate = std::ceil(.5*mnMaxFeatsPerImage);
 
     mvlTrackingHistory.resize(mnMaxFeatsPerImage);
 
-    mLastImage = cv::Mat();
+    mnMaxTrackingLength = fsSettings["Tracker.nMaxTrackingLength"];
+    mnMinTrackingLength = fsSettings["Tracker.nMinTrackingLength"];
 
     mbIsTheFirstImage = true;
 
-    mpCornerDetector = new CornerDetector(mnImageHeight, mnImageWidth);
-    mpCornerCluster = new CornerCluster(mnImageHeight, mnImageWidth);
+    mLastImage = cv::Mat();
 
-    int bUseSampson = fsSettings["Tracker.UseSampson"];
-    double nInlierThreshold = fsSettings["Tracker.nSampsonThrd"];
-    mpRansac = new Ransac(bUseSampson, nInlierThreshold);
+    mpFeatureDetector = new FeatureDetector(fsSettings);
+    mpRansac = new Ransac(fsSettings);
 
-    mTrackPub = mTrackerNode.advertise<sensor_msgs::Image>("/rvio/track", 2);
-    mNewerPub = mTrackerNode.advertise<sensor_msgs::Image>("/rvio/newer", 2);
+    mTrackPub = mTrackerNode.advertise<sensor_msgs::Image>("/rvio/track", 1);
+    mNewerPub = mTrackerNode.advertise<sensor_msgs::Image>("/rvio/newer", 1);
 }
 
 
 Tracker::~Tracker()
 {
-    delete mpCornerDetector;
-    delete mpCornerCluster;
+    delete mpFeatureDetector;
     delete mpRansac;
 }
 
 
+template <typename T1, typename T2>
 void Tracker::UndistortAndNormalize(const int N,
-                                    std::vector<cv::Point2f>& src,
-                                    std::vector<cv::Point2f>& dst)
+                                    T1& src,
+                                    T2& dst)
 {
     cv::Mat mat(N,2,CV_32F);
 
@@ -159,49 +132,6 @@ void Tracker::UndistortAndNormalize(const int N,
 }
 
 
-void Tracker::GetRotation(Eigen::Matrix3d& R,
-                          Eigen::VectorXd& xkk,
-                          std::list<ImuData*>& plImuData)
-{
-    Eigen::Matrix3d tempR;
-    tempR.setIdentity();
-
-    Eigen::Matrix3d I;
-    I.setIdentity();
-
-    Eigen::Vector3d bg = xkk.block(20,0,3,1);
-
-    for (std::list<ImuData*>::const_iterator lit=plImuData.begin();
-         lit!=plImuData.end(); ++lit)
-    {
-        Eigen::Vector3d wm = (*lit)->AngularVel;
-        double dt = (*lit)->TimeInterval;
-
-        Eigen::Vector3d w = wm-bg;
-
-        bool bIsSmallAngle = false;
-        if (w.norm()<mnSmallAngle)
-            bIsSmallAngle = true;
-
-        double w1 = w.norm();
-        double wdt = w1*dt;
-        Eigen::Matrix3d wx = SkewSymm(w);
-        Eigen::Matrix3d wx2 = wx*wx;
-
-        Eigen::Matrix3d deltaR;
-        if (bIsSmallAngle)
-            deltaR = I-dt*wx+(.5*pow(dt,2))*wx2;
-        else
-            deltaR = I-(sin(wdt)/w1)*wx+((1-cos(wdt))/pow(w1,2))*wx2;
-        assert(std::isnan(deltaR.norm())!=true);
-
-        tempR = deltaR*tempR;
-    }
-
-    R = mRci*tempR*mRic;
-}
-
-
 void Tracker::DisplayTrack(const cv::Mat& imIn,
                            std::vector<cv::Point2f>& vPoints1,
                            std::vector<cv::Point2f>& vPoints2,
@@ -209,7 +139,7 @@ void Tracker::DisplayTrack(const cv::Mat& imIn,
                            cv_bridge::CvImage& imOut)
 {
     imOut.header = std_msgs::Header();
-    imOut.encoding ="bgr8";
+    imOut.encoding = "bgr8";
 
     cvtColor(imIn, imOut.image, CV_GRAY2BGR);
 
@@ -230,52 +160,51 @@ void Tracker::DisplayTrack(const cv::Mat& imIn,
 
 void Tracker::DisplayNewer(const cv::Mat& imIn,
                            std::vector<cv::Point2f>& vFeats,
-                           std::vector<cv::Point2f>& vNewFeats,
+                           std::deque<cv::Point2f>& qNewFeats,
                            cv_bridge::CvImage& imOut)
 {
     imOut.header = std_msgs::Header();
-    imOut.encoding ="bgr8";
+    imOut.encoding = "bgr8";
 
     cvtColor(imIn, imOut.image, CV_GRAY2BGR);
 
     for (int i=0; i<(int)vFeats.size(); ++i)
         cv::circle(imOut.image, vFeats.at(i), 3, blue, 0);
 
-    for (int i=0; i<(int)vNewFeats.size(); ++i)
-        cv::circle(imOut.image, vNewFeats.at(i), 3, green, -1);
+    for (int i=0; i<(int)qNewFeats.size(); ++i)
+        cv::circle(imOut.image, qNewFeats.at(i), 3, green, -1);
 }
 
 
-void Tracker::track(cv::Mat& im,
-                    Eigen::VectorXd& xkk,
-                    std::list<ImuData*>& plImuData)
+void Tracker::track(const cv::Mat& im,
+                    std::list<ImuData*>& lImuData)
 {
     // Convert to gray scale
-    if(im.channels()==3)
+    if (im.channels()==3)
     {
-        if(mbIsRGB)
+        if (mbIsRGB)
             cvtColor(im, im, CV_RGB2GRAY);
         else
             cvtColor(im, im, CV_BGR2GRAY);
     }
-    else if(im.channels()==4)
+    else if (im.channels()==4)
     {
-        if(mbIsRGB)
-           cvtColor(im, im, CV_RGBA2GRAY);
+        if (mbIsRGB)
+            cvtColor(im, im, CV_RGBA2GRAY);
         else
-           cvtColor(im, im, CV_BGRA2GRAY);
+            cvtColor(im, im, CV_BGRA2GRAY);
     }
 
     if (mbEnableEqualizer)
     {
-        cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(3.0, cv::Size(15,15));
+        cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(3.0, cv::Size(5,5));
         clahe->apply(im, im);
     }
 
     if (mbIsTheFirstImage)
     {
         // Detect features
-        mnFeatsToTrack = mpCornerDetector->DetectWithSubPix(mnMaxFeatsPerImage, im, mvFeatsToTrack);
+        mnFeatsToTrack = mpFeatureDetector->DetectWithSubPix(im, mnMaxFeatsPerImage, 1, mvFeatsToTrack);
 
         if (mnFeatsToTrack==0)
         {
@@ -332,9 +261,7 @@ void Tracker::track(cv::Mat& im,
         }
 
         // RANSAC
-        Eigen::Matrix3d R;
-        GetRotation(R, xkk, plImuData);
-        mpRansac->FindInliers(mPoints1ForRansac, mPoints2ForRansac, R.transpose(), vInlierFlag);
+        mpRansac->FindInliers(mPoints1ForRansac, mPoints2ForRansac, lImuData, vInlierFlag);
 
         // Show the result in rviz
         cv_bridge::CvImage imTrack;
@@ -361,7 +288,7 @@ void Tracker::track(cv::Mat& im,
                 int idx = mvInlierIndices.at(i);
                 mlFreeIndices.push_back(idx);
 
-                if ((int)mvlTrackingHistory.at(idx).size()>2)
+                if ((int)mvlTrackingHistory.at(idx).size()>=mnMinTrackingLength)
                 {
                     if (nMeasCount<mnMaxFeatsForUpdate)
                     {
@@ -373,7 +300,11 @@ void Tracker::track(cv::Mat& im,
 
                 mvlTrackingHistory.at(idx).clear();
             }
-            else
+        }
+
+        for (int i=0; i<mnFeatsToTrack; ++i)
+        {
+            if (vInlierFlag.at(i))
             {
                 // Tracked
                 int idx = mvInlierIndices.at(i);
@@ -412,39 +343,32 @@ void Tracker::track(cv::Mat& im,
 
         if (!mlFreeIndices.empty())
         {
-            // Feature supplement
+            // Feature refill
             std::vector<cv::Point2f> vTempFeats;
-            std::vector<cv::Point2f> vNewFeats;
+            std::deque<cv::Point2f> qNewFeats;
 
-            mpCornerCluster->ChessGrid(mvFeatsToTrack);
-            mpCornerDetector->DetectWithSubPix(mnMaxFeatsPerImage, im, vTempFeats);
-            int nNewFeats = mpCornerCluster->FindNew(vTempFeats, vNewFeats);
+            mpFeatureDetector->DetectWithSubPix(im, mnMaxFeatsPerImage, 2, vTempFeats);
+            int nNewFeats = mpFeatureDetector->FindNewer(vTempFeats, mvFeatsToTrack, qNewFeats);
 
             // Show the result in rviz
             cv_bridge::CvImage imNewer;
-            DisplayNewer(im, vTempFeats, vNewFeats, imNewer);
+            DisplayNewer(im, vTempFeats, qNewFeats, imNewer);
             mNewerPub.publish(imNewer.toImageMsg());
 
             if (nNewFeats!=0)
             {
-                std::list<cv::Point2f> lNewFeats;
-                std::copy(vNewFeats.begin(), vNewFeats.end(), std::back_inserter(lNewFeats));
-
-                std::vector<cv::Point2f> vNewFeatsUndistNorm;
-                UndistortAndNormalize(nNewFeats, vNewFeats, vNewFeatsUndistNorm);
-
-                std::list<cv::Point2f> lNewFeatsUndistNorm;
-                std::copy(vNewFeatsUndistNorm.begin(), vNewFeatsUndistNorm.end(), std::back_inserter(lNewFeatsUndistNorm));
+                std::deque<cv::Point2f> qNewFeatsUndistNorm;
+                UndistortAndNormalize(nNewFeats, qNewFeats, qNewFeatsUndistNorm);
 
                 for (;;)
                 {
                     int idx = mlFreeIndices.front();
                     vInlierIndicesToTrack.push_back(idx);
 
-                    cv::Point2f pt = lNewFeats.front();
+                    cv::Point2f pt = qNewFeats.front();
                     mvFeatsToTrack.push_back(pt);
 
-                    cv::Point2f ptUN = lNewFeatsUndistNorm.front();
+                    cv::Point2f ptUN = qNewFeatsUndistNorm.front();
                     mvlTrackingHistory.at(idx).push_back(ptUN);
 
                     Eigen::Vector3d ptUNe = Eigen::Vector3d(ptUN.x,ptUN.y,1);
@@ -453,16 +377,16 @@ void Tracker::track(cv::Mat& im,
                     nInlierCount++;
 
                     mlFreeIndices.pop_front();
-                    lNewFeats.pop_front();
-                    lNewFeatsUndistNorm.pop_front();
+                    qNewFeats.pop_front();
+                    qNewFeatsUndistNorm.pop_front();
 
-                    if (mlFreeIndices.empty() || lNewFeats.empty() || lNewFeatsUndistNorm.empty() || nInlierCount==mnMaxFeatsPerImage)
+                    if (mlFreeIndices.empty() || qNewFeats.empty() || qNewFeatsUndistNorm.empty() || nInlierCount==mnMaxFeatsPerImage)
                         break;
                 }
             }
         }
 
-        // Update information
+        // Update tracker
         mnFeatsToTrack = nInlierCount;
         mvInlierIndices = vInlierIndicesToTrack;
         mPoints1ForRansac = tempPointsForRansac.block(0,0,3,nInlierCount);

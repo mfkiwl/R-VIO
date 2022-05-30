@@ -18,24 +18,28 @@
 * along with R-VIO. If not, see <http://www.gnu.org/licenses/>.
 */
 
+#include <fstream>
+
 #include <boost/thread.hpp>
 
-#include <Eigen/Core>
-
-#include <opencv2/core/core.hpp>
-
+#include <ros/package.h>
 #include <nav_msgs/Path.h>
+#include <nav_msgs/Odometry.h>
 #include <geometry_msgs/PoseStamped.h>
 #include <geometry_msgs/TransformStamped.h>
 
-#include "rvio/System.h"
-#include "numerics.h"
+#include "System.h"
+#include "../util/Numerics.h"
 
 
 namespace RVIO
 {
 
 nav_msgs::Path path;
+
+std::ofstream fPoseResults;
+std::ofstream fTimeResults;
+
 
 System::System(const std::string& strSettingsFile)
 {
@@ -54,7 +58,6 @@ System::System(const std::string& strSettingsFile)
     }
 
     mnImuRate = fsSettings["IMU.dps"];
-    mnCamRate = fsSettings["Camera.fps"];
 
     msigmaGyroNoise = fsSettings["IMU.sigma_g"];
     msigmaGyroBias = fsSettings["IMU.sigma_wg"];
@@ -63,34 +66,40 @@ System::System(const std::string& strSettingsFile)
 
     mnGravity = fsSettings["IMU.nG"];
 
-    msigmaImageNoiseX = fsSettings["Camera.sigma_px"];
-    msigmaImageNoiseY = fsSettings["Camera.sigma_py"];
-
     mnCamTimeOffset = fsSettings["Camera.nTimeOffset"];
 
-    const int nMaxTrackingLength = fsSettings["Tracker.nTrackingLength"];
+    const int nMaxTrackingLength = fsSettings["Tracker.nMaxTrackingLength"];
     mnSlidingWindowSize = nMaxTrackingLength-1;
 
-    int bEnableAlignment = fsSettings["INI.EnableAlignment"];
+    const int nMinTrackingLength = fsSettings["Tracker.nMinTrackingLength"];
+    mnMinCloneStates = nMinTrackingLength-1;
+
+    const int bEnableAlignment = fsSettings["INI.EnableAlignment"];
     mbEnableAlignment = bEnableAlignment;
 
-    mnInitTimeLength = fsSettings["INI.nTimeLength"];
+    const int bRecordOutputs = fsSettings["INI.RecordOutputs"];
+    mbRecordOutputs = bRecordOutputs;
+
+    if (mbRecordOutputs)
+    {
+        std::string pkg_path = ros::package::getPath("rvio");
+        fPoseResults.open(pkg_path+"/stamped_pose_ests.dat", std::ofstream::out);
+        fTimeResults.open(pkg_path+"/time_cost.dat", std::ofstream::out);
+    }
 
     mnThresholdAngle = fsSettings["INI.nThresholdAngle"];
     mnThresholdDispl = fsSettings["INI.nThresholdDispl"];
 
-    xkk.setZero(26,1);
-    Pkk.setZero(24,24);
-
-    mbIsInitialized = false;
     mbIsMoving = false;
+    mbIsReady = false;
 
-    mpTracker = new Tracker(strSettingsFile);
-    mpUpdater = new Updater(strSettingsFile);
-    mpPreIntegrator = new PreIntegrator(strSettingsFile);
-    mpSensorDatabase = new SensorDatabase();
+    mpInputBuffer = new InputBuffer();
+    mpTracker = new Tracker(fsSettings);
+    mpUpdater = new Updater(fsSettings);
+    mpPreIntegrator = new PreIntegrator(fsSettings);
 
     mPathPub = mSystemNode.advertise<nav_msgs::Path>("/rvio/trajectory", 1);
+    mOdomPub = mSystemNode.advertise<nav_msgs::Odometry>("/rvio/odometry", 1);
 }
 
 
@@ -98,163 +107,165 @@ System::~System()
 {
     delete mpTracker;
     delete mpUpdater;
+    delete mpInputBuffer;
     delete mpPreIntegrator;
-    delete mpSensorDatabase;
 }
 
 
-void System::PushImuData(ImuData* data)
+void System::initialize(const Eigen::Vector3d& w, const Eigen::Vector3d& a,
+                        const int nImuData, const bool bEnableAlignment)
 {
-    mpSensorDatabase->PushImuData(data);
+    Eigen::Vector3d g = a;
+    g.normalize();
+
+    Eigen::Matrix3d R = Eigen::Matrix3d::Identity();
+    if (bEnableAlignment)
+    {
+        // i. Align z-axis with gravity
+        Eigen::Vector3d zv = g;
+
+        // ii. Make x-axis perpendicular to z-axis
+        Eigen::Vector3d ex = Eigen::Vector3d(1,0,0);
+        Eigen::Vector3d xv = ex-zv*zv.transpose()*ex;
+        xv.normalize();
+
+        // iii. Get y-axis
+        Eigen::Vector3d yv = SkewSymm(zv)*xv;
+        yv.normalize();
+
+        // iv. The orientation of {G} in {R0}
+        Eigen::Matrix3d tempR;
+        tempR << xv, yv, zv;
+        R = tempR;
+    }
+
+    xkk.setZero(26,1);
+    xkk.block(0,0,4,1) = RotToQuat(R);
+    xkk.block(7,0,3,1) = g;
+
+    if (nImuData>1)
+    {
+        xkk.block(20,0,3,1) = w; // bg
+        xkk.block(23,0,3,1) = a-mnGravity*g; // ba
+    }
+
+    double dt = 1./mnImuRate;
+
+    Pkk.setZero(24,24);
+    Pkk(0,0) = pow(1e-3,2); // qG
+    Pkk(1,1) = pow(1e-3,2);
+    Pkk(2,2) = pow(1e-3,2);
+    Pkk(3,3) = pow(1e-3,2); // pG
+    Pkk(4,4) = pow(1e-3,2);
+    Pkk(5,5) = pow(1e-3,2);
+    Pkk(6,6) = nImuData*dt*pow(msigmaAccelNoise,2); // g
+    Pkk(7,7) = nImuData*dt*pow(msigmaAccelNoise,2);
+    Pkk(8,8) = nImuData*dt*pow(msigmaAccelNoise,2);
+    Pkk(18,18) = nImuData*dt*pow(msigmaGyroBias,2); // bg
+    Pkk(19,19) = nImuData*dt*pow(msigmaGyroBias,2);
+    Pkk(20,20) = nImuData*dt*pow(msigmaGyroBias,2);
+    Pkk(21,21) = nImuData*dt*pow(msigmaAccelBias,2); // ba
+    Pkk(22,22) = nImuData*dt*pow(msigmaAccelBias,2);
+    Pkk(23,23) = nImuData*dt*pow(msigmaAccelBias,2);
 }
 
 
-void System::MonoVIO(const cv::Mat& im, const double& timestamp, const int& seq)
+void System::MonoVIO()
 {
     static int nCloneStates = 0;
-    static int nImuDataCount = 0;
-    static int nImageCountAfterMoving = 0;
+    static int nImageCountAfterInit = 0;
 
-    std::list<ImuData*> lImuDataSeq;
-    int nImuData = mpSensorDatabase->GetImuDataByTimeStamp(timestamp+mnCamTimeOffset, lImuDataSeq);
-    if (nImuData==0)
+    std::pair<ImageData*, std::list<ImuData*> > pMeasurements;
+    if (!mpInputBuffer->GetMeasurements(mnCamTimeOffset, pMeasurements))
         return;
 
-    nImuDataCount += nImuData;
-
-
-    /*
-     * Initialization
-     */
-    if (!mbIsInitialized)
+    /* Initialization */
+    if (!mbIsReady)
     {
         static Eigen::Vector3d wm = Eigen::Vector3d::Zero();
         static Eigen::Vector3d am = Eigen::Vector3d::Zero();
+        static int nImuDataCount = 0;
 
-        while (!lImuDataSeq.empty())
+        if (!mbIsMoving)
         {
-            wm += (lImuDataSeq.front())->AngularVel;
-            am += (lImuDataSeq.front())->LinearAccel;
-            lImuDataSeq.pop_front();
+            Eigen::Vector3d ang;
+            Eigen::Vector3d vel;
+            Eigen::Vector3d displ;
+            ang.setZero();
+            vel.setZero();
+            displ.setZero();
+
+            for (std::list<ImuData*>::const_iterator lit=pMeasurements.second.begin();
+                 lit!=pMeasurements.second.end(); ++lit)
+            {
+                Eigen::Vector3d w = (*lit)->AngularVel;
+                Eigen::Vector3d a = (*lit)->LinearAccel;
+                double dt = (*lit)->TimeInterval;
+
+                a -= mnGravity*a/a.norm();
+
+                ang += dt*w;
+                vel += dt*a;
+                displ += dt*vel+.5*pow(dt,2)*a;
+            }
+
+            // If the change is larger than the threshold
+            if (ang.norm()>mnThresholdAngle || displ.norm()>mnThresholdDispl)
+                mbIsMoving = true;
         }
 
-        if (nImuDataCount>mnInitTimeLength*mnImuRate)
+        while (!pMeasurements.second.empty())
         {
-            wm = wm/nImuDataCount;
-            am = am/nImuDataCount;
-
-            Eigen::Vector3d g = am;
-            g.normalize();
-            Eigen::Vector3d gI = mnGravity*g;
-
-            Eigen::Matrix3d Rot;
-
-            if (mbEnableAlignment)
+            if (!mbIsMoving)
             {
-                // i. align z-axis with g
-                Eigen::Vector3d zv = g;
-
-                // ii. make x-axis perpendicular to z-axis
-                Eigen::Vector3d ex = Eigen::Vector3d(1,0,0);
-                Eigen::Vector3d xv = ex-zv*zv.transpose()*ex;
-                xv.normalize();
-
-                // iii. get y-axis
-                Eigen::Vector3d yv = SkewSymm(zv)*xv;
-                yv.normalize();
-
-                // The orientation of {G} in {R0}
-                Rot << xv, yv, zv;
+                wm += (pMeasurements.second.front())->AngularVel;
+                am += (pMeasurements.second.front())->LinearAccel;
+                pMeasurements.second.pop_front();
+                nImuDataCount++;
             }
             else
-                Rot.setIdentity();
+            {
+                if (nImuDataCount==0)
+                {
+                    wm = (pMeasurements.second.front())->AngularVel;
+                    am = (pMeasurements.second.front())->LinearAccel;
+                    nImuDataCount = 1;
+                }
+                else
+                {
+                    wm = wm/nImuDataCount;
+                    am = am/nImuDataCount;
+                }
 
-            xkk.setZero(26,1);
-            xkk.block(0,0,4,1) = RotToQuat(Rot);
-            xkk.block(7,0,3,1) = g;
-            xkk.block(20,0,3,1) = wm; // bg
-            xkk.block(23,0,3,1) = am-gI; // ba
+                initialize(wm, am, nImuDataCount, mbEnableAlignment);
 
-            double dt = 1/mnImuRate;
-
-            Pkk.setZero(24,24);
-            Pkk(0,0) = pow(1e-3,2); // qG
-            Pkk(1,1) = pow(1e-3,2);
-            Pkk(2,2) = pow(1e-3,2);
-            Pkk(3,3) = pow(1e-3,2); // pG
-            Pkk(4,4) = pow(1e-3,2);
-            Pkk(5,5) = pow(1e-3,2);
-            Pkk(6,6) = nImuDataCount*dt*pow(msigmaAccelNoise,2); // g
-            Pkk(7,7) = nImuDataCount*dt*pow(msigmaAccelNoise,2);
-            Pkk(8,8) = nImuDataCount*dt*pow(msigmaAccelNoise,2);
-            Pkk(18,18) = nImuDataCount*dt*pow(msigmaGyroBias,2); // bg
-            Pkk(19,19) = nImuDataCount*dt*pow(msigmaGyroBias,2);
-            Pkk(20,20) = nImuDataCount*dt*pow(msigmaGyroBias,2);
-            Pkk(21,21) = nImuDataCount*dt*pow(msigmaAccelBias,2); // ba
-            Pkk(22,22) = nImuDataCount*dt*pow(msigmaAccelBias,2);
-            Pkk(23,23) = nImuDataCount*dt*pow(msigmaAccelBias,2);
-
-            mbIsInitialized = true;
+                mbIsReady = true;
+                break;
+            }
         }
 
-        if (!mbIsInitialized) return;
-    }
-
-
-    /**
-     * Static/Moving detection
-     */
-    if (!mbIsMoving)
-    {
-        Eigen::Vector3d angle;
-        Eigen::Vector3d displ;
-        angle.setZero();
-        displ.setZero();
-
-        for (std::list<ImuData*>::const_iterator lit=lImuDataSeq.begin();
-             lit!=lImuDataSeq.end(); ++lit)
-        {
-            Eigen::Vector3d w = (*lit)->AngularVel;
-            Eigen::Vector3d a = (*lit)->LinearAccel;
-            double dt = (*lit)->TimeInterval;
-
-            angle += dt*w;
-            displ += .5*pow(dt,2)*(a-mnGravity*a/a.norm());
-        }
-
-        // If the change is lager than the threshold
-        if (angle.norm()>mnThresholdAngle || displ.norm()>mnThresholdDispl)
-            // Is moving
-            mbIsMoving = true;
-        else
-            // Is static
+        if (!mbIsReady)
             return;
     }
 
-    nImageCountAfterMoving++;
+    nImageCountAfterInit++;
 
+    ros::WallTime t1, t2, t3;
 
-    /**
-     * Visual tracking & Propagation
-     */
-    boost::thread thdTracking(&Tracker::track, mpTracker, im, std::ref(xkk), std::ref(lImuDataSeq));
-    boost::thread thdPropagate(&PreIntegrator::propagate, mpPreIntegrator, std::ref(xkk), std::ref(Pkk), std::ref(lImuDataSeq));
+    t1 = ros::WallTime::now();
 
-    thdTracking.join();
-    thdPropagate.join();
+    /* Visual tracking */
+    mpTracker->track(pMeasurements.first->Image, pMeasurements.second);
 
+    t2 = ros::WallTime::now();
 
-    /**
-     * Update
-     */
-    if (nCloneStates==mnSlidingWindowSize)
+    /* Propagation */
+    mpPreIntegrator->propagate(xkk, Pkk, pMeasurements.second);
+
+    /* Update */
+    if (nCloneStates>mnMinCloneStates)
     {
-        Eigen::VectorXd xk1k = mpPreIntegrator->xk1k;
-        Eigen::MatrixXd Pk1k = mpPreIntegrator->Pk1k;
-        std::vector<char> vFeatTypesForUpdate = mpTracker->mvFeatTypesForUpdate;
-        std::vector<std::list<cv::Point2f> > vlFeatMeasForUpdate = mpTracker->mvlFeatMeasForUpdate;
-
-        mpUpdater->update(xk1k, Pk1k, vFeatTypesForUpdate, vlFeatMeasForUpdate);
+        mpUpdater->update(mpPreIntegrator->xk1k, mpPreIntegrator->Pk1k, mpTracker->mvFeatTypesForUpdate, mpTracker->mvlFeatMeasForUpdate);
 
         xkk = mpUpdater->xk1k1;
         Pkk = mpUpdater->Pk1k1;
@@ -265,11 +276,8 @@ void System::MonoVIO(const cv::Mat& im, const double& timestamp, const int& seq)
         Pkk = mpPreIntegrator->Pk1k;
     }
 
-
-    /**
-     * State augmentation
-     */
-    if (nImageCountAfterMoving>1)
+    /* State augmentation */
+    if (nImageCountAfterInit>1)
     {
         if (nCloneStates<mnSlidingWindowSize)
         {
@@ -314,27 +322,25 @@ void System::MonoVIO(const cv::Mat& im, const double& timestamp, const int& seq)
         }
     }
 
-
-    /**
-     * Composition
-     */
+    /* Composition */
     Eigen::Vector4d qG = xkk.block(0,0,4,1);
     Eigen::Vector3d pG = xkk.block(4,0,3,1);
     Eigen::Vector3d gk = xkk.block(7,0,3,1);
     Eigen::Vector4d qk = xkk.block(10,0,4,1);
     Eigen::Vector3d pk = xkk.block(14,0,3,1);
+    Eigen::Vector3d vk = xkk.block(17,0,3,1);
 
-    Eigen::Matrix3d RG_T = QuatToRot(qG).transpose();
+    Eigen::Matrix3d RG = QuatToRot(qG);
     Eigen::Matrix3d Rk = QuatToRot(qk);
-
-    Eigen::Vector4d qkG = QuatMul(qk,qG);
-    Eigen::Vector3d pkG = Rk*(pG-pk);
-    Eigen::Vector3d pGk = RG_T*(pk-pG);
 
     gk = Rk*gk;
     gk.normalize();
 
-    // Pkk-->Pk
+    Eigen::Vector4d qkG = QuatMul(qk,qG);
+    Eigen::Vector3d pkG = Rk*(pG-pk);
+    Eigen::Vector3d pGk = RG.transpose()*(pk-pG);
+
+    // Pk
     Eigen::Matrix<double,24,24> Vk;
     Vk.setZero();
     Vk.block(0,0,3,3) = Rk;
@@ -346,28 +352,39 @@ void System::MonoVIO(const cv::Mat& im, const double& timestamp, const int& seq)
     Vk.block(6,9,3,3) = SkewSymm(gk);
     Vk.block(15,15,9,9).setIdentity();
 
-    Eigen::MatrixXd Uk(24+6*nCloneStates,24+6*nCloneStates);
-    Uk.setIdentity();
-    Uk.block(0,0,24,24) = Vk;
-
-    Pkk = Uk*Pkk*(Uk.transpose());
+    Pkk.block(0,0,24,24) = Vk*Pkk.block(0,0,24,24)*(Vk.transpose());
+    Pkk.block(0,24,24,6*nCloneStates) = Vk*Pkk.block(0,24,24,6*nCloneStates);
+    Pkk.block(24,0,6*nCloneStates,24) = Pkk.block(0,24,24,6*nCloneStates).transpose();
     Pkk = .5*(Pkk+Pkk.transpose());
 
-    // xkk-->xk
+    // xk
     xkk.block(0,0,4,1) = qkG;
     xkk.block(4,0,3,1) = pkG;
     xkk.block(7,0,3,1) = gk;
     xkk.block(10,0,4,1) = Eigen::Vector4d(0,0,0,1);
     xkk.block(14,0,3,1) = Eigen::Vector3d(0,0,0);
 
+    t3 = ros::WallTime::now();
+
+    if (mbRecordOutputs)
+    {
+        fPoseResults << std::setprecision(19) << pMeasurements.first->Timestamp << " "
+                     << pGk(0) << " " << pGk(1) << " " << pGk(2) << " "
+                     << qkG(0) << " " << qkG(1) << " " << qkG(2) << " " << qkG(3) << "\n";
+        fPoseResults.flush();
+
+        fTimeResults << nImageCountAfterInit << std::setprecision(19) << " "
+                     << 1e3*(t2.toSec()-t1.toSec()) << " "
+                     << 1e3*(t3.toSec()-t2.toSec()) << "\n";
+        fTimeResults.flush();
+    }
+
     ROS_INFO("qkG: %5f, %5f, %5f, %5f", qkG(0), qkG(1), qkG(2), qkG(3));
     ROS_INFO("pGk: %5f, %5f, %5f\n", pGk(0), pGk(1), pGk(2));
 
 
-    /**
-     * Interact with ROS rviz
-     */
-    // Broadcast tf
+    /* Interact with ROS rviz */
+    // Broadcast tf message
     geometry_msgs::TransformStamped transformStamped;
     transformStamped.header.stamp = ros::Time::now();
     transformStamped.header.frame_id = "world";
@@ -381,6 +398,24 @@ void System::MonoVIO(const cv::Mat& im, const double& timestamp, const int& seq)
     transformStamped.transform.rotation.w = qkG(3);
 
     mTfPub.sendTransform(transformStamped);
+
+    // Broadcast odometry message
+    nav_msgs::Odometry odom;
+    odom.header.stamp = ros::Time::now();
+    odom.header.frame_id = "world";
+    odom.pose.pose.position.x = pGk(0);
+    odom.pose.pose.position.y = pGk(1);
+    odom.pose.pose.position.z = pGk(2);
+    odom.pose.pose.orientation.x = qkG(0);
+    odom.pose.pose.orientation.y = qkG(1);
+    odom.pose.pose.orientation.z = qkG(2);
+    odom.pose.pose.orientation.w = qkG(3);
+    odom.child_frame_id = "imu";
+    odom.twist.twist.linear.x = vk(0);
+    odom.twist.twist.linear.y = vk(1);
+    odom.twist.twist.linear.z = vk(2);
+
+    mOdomPub.publish(odom);
 
     // Visualize the trajectory
     geometry_msgs::PoseStamped pose;

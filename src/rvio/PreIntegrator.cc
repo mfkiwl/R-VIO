@@ -20,41 +20,37 @@
 
 #include <opencv2/core/core.hpp>
 
-#include "rvio/PreIntegrator.h"
-#include "numerics.h"
+#include "PreIntegrator.h"
+#include "../util/Numerics.h"
 
 
 namespace RVIO
 {
 
-PreIntegrator::PreIntegrator(const std::string& strSettingsFile)
+PreIntegrator::PreIntegrator(const cv::FileStorage& fsSettings)
 {
-    // Read settings file
-    cv::FileStorage fsSettings(strSettingsFile, cv::FileStorage::READ);
-
-    msigmaGyroNoise = fsSettings["IMU.sigma_g"];
-    msigmaGyroBias = fsSettings["IMU.sigma_wg"];
-    msigmaAccelNoise = fsSettings["IMU.sigma_a"];
-    msigmaAccelBias = fsSettings["IMU.sigma_wa"];
-
+    mnGravity = fsSettings["IMU.nG"];
     mnSmallAngle = fsSettings["IMU.nSmallAngle"];
 
-    mnGravity = fsSettings["IMU.nG"];
+    mnGyroNoiseSigma = fsSettings["IMU.sigma_g"];
+    mnGyroRandomWalkSigma = fsSettings["IMU.sigma_wg"];
+    mnAccelNoiseSigma = fsSettings["IMU.sigma_a"];
+    mnAccelRandomWalkSigma = fsSettings["IMU.sigma_wa"];
+
+    ImuNoiseMatrix.setIdentity();
+    ImuNoiseMatrix.block<3,3>(0,0) *= pow(mnGyroNoiseSigma,2);
+    ImuNoiseMatrix.block<3,3>(3,3) *= pow(mnGyroRandomWalkSigma,2);
+    ImuNoiseMatrix.block<3,3>(6,6) *= pow(mnAccelNoiseSigma,2);
+    ImuNoiseMatrix.block<3,3>(9,9) *= pow(mnAccelRandomWalkSigma,2);
 
     xk1k.setZero(26,1);
     Pk1k.setZero(24,24);
-
-    Sigma.setIdentity();
-    Sigma.block<3,3>(0,0) *= pow(msigmaGyroNoise,2);
-    Sigma.block<3,3>(3,3) *= pow(msigmaGyroBias,2);
-    Sigma.block<3,3>(6,6) *= pow(msigmaAccelNoise,2);
-    Sigma.block<3,3>(9,9) *= pow(msigmaAccelBias,2);
 }
 
 
 void PreIntegrator::propagate(Eigen::VectorXd& xkk,
                               Eigen::MatrixXd& Pkk,
-                              std::list<ImuData*>& plImuData)
+                              std::list<ImuData*>& lImuData)
 {
     Eigen::Vector3d gk = xkk.block(7,0,3,1);  // unit vector
     Eigen::Vector4d qk = xkk.block(10,0,4,1); // [0,0,0,1]
@@ -64,7 +60,7 @@ void PreIntegrator::propagate(Eigen::VectorXd& xkk,
     Eigen::Vector3d ba = xkk.block(23,0,3,1);
 
     // Gravity vector in {R}
-    Eigen::Vector3d gR = mnGravity*gk;
+    Eigen::Vector3d gR = gk;
 
     // Local velocity in {R}
     Eigen::Vector3d vR = vk;
@@ -82,10 +78,12 @@ void PreIntegrator::propagate(Eigen::VectorXd& xkk,
     // State transition matrix
     Eigen::Matrix<double,24,24> F;
     Eigen::Matrix<double,24,24> Phi;
+    Eigen::Matrix<double,24,24> Psi;
     F.setZero();
     Phi.setZero();
+    Psi.setIdentity();
 
-    // Noise covariance matrix
+    // Noise matrix
     Eigen::Matrix<double,24,12> G;
     Eigen::Matrix<double,24,24> Q;
     G.setZero();
@@ -96,8 +94,8 @@ void PreIntegrator::propagate(Eigen::VectorXd& xkk,
 
     double Dt = 0;
 
-    for (std::list<ImuData*>::const_iterator lit=plImuData.begin();
-         lit!=plImuData.end(); ++lit)
+    for (std::list<ImuData*>::const_iterator lit=lImuData.begin();
+         lit!=lImuData.end(); ++lit)
     {
         Eigen::Vector3d wm = (*lit)->AngularVel;
         Eigen::Vector3d am = (*lit)->LinearAccel;
@@ -127,29 +125,21 @@ void PreIntegrator::propagate(Eigen::VectorXd& xkk,
         F.block<3,3>(12,9) = -Rk_T*vx;
         F.block<3,3>(12,15) = Rk_T;
         F.block<3,3>(15,6) = -mnGravity*Rk;
-        F.block<3,3>(15,9) = -SkewSymm(gk);
+        F.block<3,3>(15,9) = -mnGravity*SkewSymm(gk);
         F.block<3,3>(15,15) = -wx;
         F.block<3,3>(15,18) = -vx;
         F.block<3,3>(15,21) = -I;
         Phi = Eigen::Matrix<double,24,24>::Identity()+dt*F;
+        Psi = Phi*Psi;
 
         G.block<3,3>(9,0) = -I;
         G.block<3,3>(15,0) = -vx;
         G.block<3,3>(15,6) = -I;
         G.block<3,3>(18,3) = I;
         G.block<3,3>(21,9) = I;
-        Q = dt*G*Sigma*(G.transpose());
+        Q = dt*G*ImuNoiseMatrix*(G.transpose());
 
         Pkk.block(0,0,24,24) = Phi*(Pkk.block(0,0,24,24))*(Phi.transpose())+Q;
-
-        // For clone state covariance
-        int nCloneStates = (xkk.rows()-26)/7;
-        if (nCloneStates>0)
-        {
-            Pkk.block(0,24,24,6*nCloneStates) = Phi*Pkk.block(0,24,24,6*nCloneStates);
-            Pkk.block(24,0,6*nCloneStates,24) = Pkk.block(0,24,24,6*nCloneStates).transpose();
-        }
-        Pkk = .5*(Pkk+Pkk.transpose());
 
         // State
         Eigen::Matrix3d deltaR;
@@ -182,9 +172,10 @@ void PreIntegrator::propagate(Eigen::VectorXd& xkk,
         dp += Rk_T*(.5*pow(dt,2)*I+f1*wx+f2*wx2)*a;
         dv += Rk_T*(dt*I+f3*wx+f4*wx2)*a;
 
-        pk = vR*Dt-.5*gR*pow(Dt,2)+dp;
-        vk = Rk*(vR-gR*Dt+dv);
+        pk = vR*Dt-.5*mnGravity*gR*pow(Dt,2)+dp;
+        vk = Rk*(vR-mnGravity*gR*Dt+dv);
         gk = Rk*gR;
+        gk.normalize();
     }
 
     xk1k = xkk;
@@ -192,6 +183,13 @@ void PreIntegrator::propagate(Eigen::VectorXd& xkk,
     xk1k.block(14,0,3,1) = pk;
     xk1k.block(17,0,3,1) = vk;
 
+    int nCloneStates = (xkk.rows()-26)/7;
+    if (nCloneStates>0)
+    {
+        Pkk.block(0,24,24,6*nCloneStates) = Psi*Pkk.block(0,24,24,6*nCloneStates);
+        Pkk.block(24,0,6*nCloneStates,24) = Pkk.block(0,24,24,6*nCloneStates).transpose();
+    }
+    Pkk = .5*(Pkk+Pkk.transpose());
     Pk1k = Pkk;
 }
 
